@@ -11,3 +11,6 @@ wheels/
 
 # Secrets
 .env
+
+# Data files
+eu_ai_act.md
