@@ -1,11 +1,14 @@
-"""Async SiftText MCP client over StreamableHTTP."""
+"""Async SiftText MCP client over StreamableHTTP — with perf instrumentation."""
 
 import asyncio
 import json
 import os
 import re
+import time
 
 import httpx
+
+from perf import perf
 
 ENDPOINT = "https://app.sifttext.com/mcp"
 PROTOCOL_VERSION = "2025-03-26"
@@ -55,8 +58,19 @@ class SiftTextClient:
         headers = {}
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
+
+        t0 = time.time()
         resp = await self._http.post(ENDPOINT, json=payload, headers=headers)
+        http_ms = (time.time() - t0) * 1000
+
         resp.raise_for_status()
+
+        # Log raw HTTP round-trip
+        method = payload.get("method", "unknown")
+        tool = ""
+        if method == "tools/call":
+            tool = payload.get("params", {}).get("name", "")
+        perf.event("mcp_http", http_ms, method=method, tool=tool)
 
         # Capture session ID
         sid = resp.headers.get("Mcp-Session-Id") or resp.headers.get("mcp-session-id")
@@ -110,7 +124,11 @@ class SiftTextClient:
             "params": {"name": tool_name, "arguments": kwargs},
             "id": self._next_id(),
         }
+        t0 = time.time()
         data = await self._post(payload)
+        dur = (time.time() - t0) * 1000
+        perf.event("mcp_tool", dur, tool=tool_name)
+
         if not data:
             return ""
         # Extract text from first content block
@@ -154,6 +172,7 @@ class SiftTextClient:
         tree_id: str | None = None,
         propagation_check: str = PROPAGATION,
         crystallization: str | None = None,
+        pipeline_mode: bool = False,
     ) -> str:
         """Create a child node. Returns the result text."""
         kwargs: dict = {
@@ -166,6 +185,8 @@ class SiftTextClient:
             kwargs["tree_id"] = tree_id
         if crystallization:
             kwargs["crystallization"] = crystallization
+        if pipeline_mode:
+            kwargs["pipeline_mode"] = True
         return await self._call_tool("ideation_create_node", **kwargs)
 
     async def get_outline(self, tree_id: str, max_depth: int | None = None, node_id: str | None = None) -> str:
@@ -188,27 +209,36 @@ class SiftTextClient:
         target_name: str,
         description: str,
         propagation_check: str = PROPAGATION,
+        target_node_id: str | None = None,
+        pipeline_mode: bool = False,
     ) -> str:
-        return await self._call_tool(
-            "ideation_link_by_name",
-            source_node_id=source_node_id,
-            target_name_query=target_name,
-            description=description,
-            propagation_check=propagation_check,
-        )
+        kwargs: dict = {
+            "source_node_id": source_node_id,
+            "target_name_query": target_name,
+            "description": description,
+            "propagation_check": propagation_check,
+        }
+        if target_node_id:
+            kwargs["target_node_id"] = target_node_id
+        if pipeline_mode:
+            kwargs["pipeline_mode"] = True
+        return await self._call_tool("ideation_link_by_name", **kwargs)
 
     async def crystallize_append(
         self,
         node_id: str,
         text: str,
         propagation_check: str = PROPAGATION,
+        pipeline_mode: bool = False,
     ) -> str:
-        return await self._call_tool(
-            "ideation_crystallize_append",
-            node_id=node_id,
-            crystallization=text,
-            propagation_check=propagation_check,
-        )
+        kwargs: dict = {
+            "node_id": node_id,
+            "crystallization": text,
+            "propagation_check": propagation_check,
+        }
+        if pipeline_mode:
+            kwargs["pipeline_mode"] = True
+        return await self._call_tool("ideation_crystallize_append", **kwargs)
 
     async def close(self) -> None:
         await self._http.aclose()
