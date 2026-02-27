@@ -6,6 +6,8 @@ import os
 import re
 import time
 
+from dotenv import load_dotenv
+
 from chunk import chunk_pdf
 from sifttext import SiftTextClient
 from agents import triage_agent, linkage_agent, query_agent
@@ -31,6 +33,7 @@ def _banner(stage: int, title: str):
 async def main():
     global _T0
     _T0 = time.time()
+    load_dotenv()
 
     for var in ("SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"):
         if var not in os.environ:
