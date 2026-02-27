@@ -79,8 +79,11 @@ async def main():
         # Stage 3: Linkage pass
         print("Running linkage pass...")
         t2 = time.time()
-        link_count = await linkage_agent(tree_id, sift, args.smart_model)
-        print(f"Added {link_count} cross-references ({time.time() - t2:.1f}s)")
+        try:
+            link_count = await linkage_agent(tree_id, sift, args.smart_model)
+            print(f"Added {link_count} cross-references ({time.time() - t2:.1f}s)")
+        except Exception as e:
+            print(f"Warning: linkage pass failed ({type(e).__name__}: {e}), continuing without cross-references")
 
         # Stage 4: Interactive query loop
         total = time.time() - t0
@@ -91,8 +94,11 @@ async def main():
                 q = await asyncio.to_thread(input, "> ")
                 if not q.strip():
                     continue
-                answer = await query_agent(q, tree_id, sift, args.smart_model)
-                print(f"\n{answer}\n")
+                try:
+                    answer = await query_agent(q, tree_id, sift, args.smart_model)
+                    print(f"\n{answer}\n")
+                except Exception as e:
+                    print(f"\nError answering query ({type(e).__name__}: {e}). Try again.\n")
         except (KeyboardInterrupt, EOFError):
             print("\nDone.")
 
@@ -103,8 +109,8 @@ async def main():
 def parse_args():
     p = argparse.ArgumentParser(description="Enterprise Doc Agent")
     p.add_argument("--pdf", default="eu_ai_act.pdf", help="Path to PDF file")
-    p.add_argument("--model", default="openai/gpt-4.1-mini", help="Triage model")
-    p.add_argument("--smart-model", default="openai/gpt-4.1", help="Linkage/query model")
+    p.add_argument("--model", default="openai/gpt-5.2-chat", help="Triage model")
+    p.add_argument("--smart-model", default="openai/gpt-5.2", help="Linkage/query model")
     return p.parse_args()
 
 

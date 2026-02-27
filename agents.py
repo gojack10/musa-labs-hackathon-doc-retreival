@@ -1,5 +1,6 @@
 """Agent functions: triage, linkage, and query over SiftText trees."""
 
+import asyncio
 import re
 
 from llm import complete
@@ -70,7 +71,7 @@ async def triage_agent(
     tree_id: str,
     parent_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-4.1-mini",
+    model: str = "openai/gpt-5.2-chat",
 ) -> str:
     """Analyze a document chunk via LLM and create a SiftText node.
 
@@ -113,7 +114,7 @@ async def triage_agent(
 async def linkage_agent(
     tree_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-4.1-mini",
+    model: str = "openai/gpt-5.2",
     max_nodes: int | None = None,
 ) -> int:
     """Read tree structure and add cross-reference links between nodes.
@@ -127,36 +128,51 @@ async def linkage_agent(
     if max_nodes:
         node_ids = node_ids[:max_nodes]
 
-    # Read all nodes and build a lookup
-    nodes: list[dict] = []
-    for nid in node_ids:
-        content = await sift.get_node(nid)
-        # Extract name from XML-like response
+    # Read all nodes in parallel (semaphore to avoid hammering API)
+    sem = asyncio.Semaphore(20)
+
+    async def _read_node(nid: str) -> dict:
+        async with sem:
+            content = await sift.get_node(nid)
         name_match = re.search(r"<name>(.*?)</name>", content)
         name = name_match.group(1) if name_match else nid
-        nodes.append({"id": nid, "name": name, "content": content})
+        return {"id": nid, "name": name, "content": content}
 
-    # Process in batches of 8
-    links_added = 0
+    node_results = await asyncio.gather(
+        *[_read_node(nid) for nid in node_ids], return_exceptions=True
+    )
+    nodes: list[dict] = [r for r in node_results if isinstance(r, dict)]
+    read_failures = [r for r in node_results if isinstance(r, Exception)]
+    if read_failures:
+        print(f"  Warning: {len(read_failures)} node reads failed")
+
+    # Build name -> id lookup for link resolution
+    name_to_id: dict[str, str] = {n["name"]: n["id"] for n in nodes}
+
+    # Process in batches of 8 — collect link tasks across all batches
     batch_size = 8
+    pending_links: list[dict] = []
 
     for i in range(0, len(nodes), batch_size):
         batch = nodes[i : i + batch_size]
 
         batch_text = ""
         for node in batch:
-            # Extract just crystallization for brevity
             cryst_match = re.search(
                 r"<crystallization>(.*?)</crystallization>", node["content"], re.DOTALL
             )
             cryst = cryst_match.group(1).strip()[:2000] if cryst_match else ""
             batch_text += f"\n### {node['name']}\n{cryst}\n"
 
-        llm_output = await complete(
-            system=LINKAGE_SYSTEM.format(outline=outline),
-            user=f"Analyze these nodes for cross-references:\n{batch_text}",
-            model=model,
-        )
+        try:
+            llm_output = await complete(
+                system=LINKAGE_SYSTEM.format(outline=outline),
+                user=f"Analyze these nodes for cross-references:\n{batch_text}",
+                model=model,
+            )
+        except Exception as e:
+            print(f"  Warning: linkage batch {i // batch_size + 1} failed: {e}")
+            continue
 
         # Parse "SOURCE_TITLE -> TARGET_TITLE | reason" lines
         for line in llm_output.strip().split("\n"):
@@ -167,26 +183,29 @@ async def linkage_agent(
             source_title = source_title.strip()
             target_title = target_title.strip()
 
-            # Find source node ID
-            source_id = None
-            for node in nodes:
-                if node["name"] == source_title:
-                    source_id = node["id"]
-                    break
-
+            source_id = name_to_id.get(source_title)
             if not source_id:
                 continue
 
+            pending_links.append({
+                "source_node_id": source_id,
+                "target_name": target_title,
+                "description": reason.strip(),
+            })
+
+    # Create all links in parallel
+    async def _create_link(link: dict) -> bool:
+        async with sem:
             try:
-                await sift.link_by_name(
-                    source_node_id=source_id,
-                    target_name=target_title,
-                    description=reason.strip(),
-                )
-                links_added += 1
+                await sift.link_by_name(**link)
+                return True
             except Exception:
-                # Link failures are non-fatal — target name might not match exactly
-                continue
+                return False
+
+    link_results = await asyncio.gather(
+        *[_create_link(lnk) for lnk in pending_links], return_exceptions=True
+    )
+    links_added = sum(1 for r in link_results if r is True)
 
     return links_added
 
@@ -195,7 +214,7 @@ async def query_agent(
     question: str,
     tree_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-5.2-chat",
+    model: str = "openai/gpt-5.2",
 ) -> str:
     """Search the tree and answer a question with grounded citations."""
     # Search for relevant nodes
