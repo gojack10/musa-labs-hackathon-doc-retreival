@@ -36,7 +36,7 @@ async def main():
     perf.start()
     load_dotenv()
 
-    for var in ("SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"):
+    for var in ("SIFTTEXT_API_KEY", "AZURE_OPENAI_KEY"):
         if not os.environ.get(var):
             raise SystemExit(f"Error: Set {var} in .env or environment")
 
@@ -182,8 +182,8 @@ async def main():
 def parse_args():
     p = argparse.ArgumentParser(description="Enterprise Doc Agent")
     p.add_argument("--input", default="eu_ai_act.md", help="Path to markdown file")
-    p.add_argument("--model", default="openai/gpt-5.2-chat", help="Triage model")
-    p.add_argument("--smart-model", default="openai/gpt-5.2", help="Linkage/query model")
+    p.add_argument("--model", default="gpt-5.2-chat-main", help="Triage model (Azure deployment name)")
+    p.add_argument("--smart-model", default="gpt-5.2-chat-main", help="Linkage/query model (Azure deployment name)")
     p.add_argument("--query-only", metavar="TREE_ID",
                    help="Skip pipeline, jump straight to query loop on an existing tree")
     return p.parse_args()

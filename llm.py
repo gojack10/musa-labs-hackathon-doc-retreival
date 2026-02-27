@@ -1,32 +1,40 @@
-"""Thin OpenRouter LLM client using OpenAI SDK — with perf instrumentation."""
+"""Azure OpenAI LLM client — with perf instrumentation."""
 
 import os
 import time
 
-from openai import AsyncOpenAI
+from openai import AsyncAzureOpenAI
 
 from perf import perf
 
-_client: AsyncOpenAI | None = None
+AZURE_ENDPOINT = "https://odlu-mm5f7ry7-eastus2.cognitiveservices.azure.com/"
+AZURE_API_VERSION = "2024-12-01-preview"
+DEFAULT_DEPLOYMENT = "gpt-5.2-chat-main"
+
+_client: AsyncAzureOpenAI | None = None
 
 
-def _get_client() -> AsyncOpenAI:
+def _get_client() -> AsyncAzureOpenAI:
     global _client
     if _client is None:
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        api_key = os.environ.get("AZURE_OPENAI_KEY")
         if not api_key:
-            raise SystemExit("Error: Set OPENROUTER_API_KEY environment variable")
-        _client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+            raise SystemExit("Error: Set AZURE_OPENAI_KEY environment variable")
+        _client = AsyncAzureOpenAI(
+            azure_endpoint=AZURE_ENDPOINT,
+            api_key=api_key,
+            api_version=AZURE_API_VERSION,
+        )
     return _client
 
 
-def get_client() -> AsyncOpenAI:
+def get_client() -> AsyncAzureOpenAI:
     """Get or create the shared AsyncOpenAI client."""
     return _get_client()
 
 
 async def complete(
-    system: str, user: str, model: str = "openai/gpt-5.2"
+    system: str, user: str, model: str = DEFAULT_DEPLOYMENT
 ) -> str:
     """Single-shot chat completion. Returns assistant message content."""
     t0 = time.time()
@@ -45,7 +53,6 @@ async def complete(
         if not resp.choices:
             raise RuntimeError(f"LLM returned no choices ({model})")
         choice = resp.choices[0]
-        # OpenRouter buries errors in the choice object instead of raising
         err = getattr(choice, "error", None)
         if err or getattr(choice, "finish_reason", None) == "error":
             msg = err.get("message", err) if isinstance(err, dict) else err or "unknown error"

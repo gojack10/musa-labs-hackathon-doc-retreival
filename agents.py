@@ -175,7 +175,7 @@ async def triage_agent(
     tree_id: str,
     parent_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-5.2-chat",
+    model: str = "gpt-5.2-chat-main",
     pipeline_mode: bool = False,
 ) -> str:
     """Analyze a document chunk via LLM and create a SiftText node.
@@ -221,7 +221,7 @@ async def triage_agent(
 async def linkage_agent(
     tree_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-5.2",
+    model: str = "gpt-5.2-chat-main",
     max_nodes: int | None = None,
     llm_concurrency: int = 4,
     link_concurrency: int = 20,
@@ -375,7 +375,7 @@ async def query_agent(
     question: str,
     tree_id: str,
     sift: SiftTextClient,
-    model: str = "openai/gpt-5.2",
+    model: str = "gpt-5.2-chat-main",
     max_turns: int = 10,
     history: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
@@ -398,7 +398,7 @@ async def query_agent(
     full_response = ""
     t0 = time.time()
 
-    reasoning_kwargs = {"extra_body": {"reasoning": {"effort": "high"}}}
+    reasoning_kwargs = {}  # Azure OpenAI — no extra_body reasoning
 
     def _stream_reasoning(rd, state: dict) -> list[dict]:
         """Print reasoning tokens dimmed; return raw details for context preservation."""
