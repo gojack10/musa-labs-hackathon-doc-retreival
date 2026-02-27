@@ -156,6 +156,7 @@ async def main():
         _banner(4, "Interactive Query")
         print(f"{_ts()}   Tree: {tree_id}")
         print(f"{_ts()}   Ask questions about the EU AI Act (ctrl+c to exit)\n")
+        history: list[dict] | None = None
         try:
             while True:
                 q = await asyncio.to_thread(input, "> ")
@@ -163,7 +164,7 @@ async def main():
                     continue
                 print()
                 try:
-                    await query_agent(q, tree_id, sift, args.smart_model)
+                    _, history = await query_agent(q, tree_id, sift, args.smart_model, history=history)
                     print()
                 except Exception as e:
                     print(f"\n{_ts()}   ! Error: {type(e).__name__}: {e}. Try again.\n")

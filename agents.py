@@ -5,9 +5,14 @@ import json
 import re
 import time
 
+from rich.console import Console
+from rich.markdown import Markdown
+
 from llm import complete, get_client
 from perf import perf
 from sifttext import SiftTextClient
+
+_console = Console()
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -57,17 +62,35 @@ QUERY_SYSTEM = """\
 You are an expert on the EU AI Act (Regulation (EU) 2024/1689). You have access to \
 a structured knowledge tree containing the full text and analysis of the regulation.
 
-Use your tools to research the tree before answering:
-1. Search for terms related to the question
-2. Read relevant nodes for detailed content and cross-references
-3. Follow links to related sections when needed
-4. Synthesize a grounded answer
+## How to use the tree
 
-Rules:
-- Always use tools to find information — do not rely on prior knowledge
+The tree has EXPLICIT structure — chapters, sections, and cross-reference links \
+between nodes. Use this structure to navigate, not shotgun keyword searches.
+
+**Step 1 — Orient:** Call get_outline() FIRST to see the tree's hierarchy. This is \
+your map. You'll see chapter names and section names with their IDs. Use this to \
+know WHERE to look. (1 call)
+
+**Step 2 — Search & Read:** Do 1-2 targeted searches. Read the 2-4 most relevant \
+nodes. IMPORTANT: when you read a node, check its <links> section — forward links, \
+see_also, and backlinks point to related nodes. Follow those links instead of \
+searching for the same content. (1-2 rounds)
+
+**Step 3 — Answer:** After 2-3 rounds of tool calls, STOP and answer. A focused, \
+well-cited answer beats an exhaustive one. Do NOT keep searching for completeness.
+
+## Multi-turn conversations
+
+This is a multi-turn conversation. Prior questions, tool results, and answers are \
+preserved in context. Use information from earlier turns to inform follow-up answers \
+— you don't need to re-fetch what you already have, but you CAN use any tool at any \
+time to dig deeper, follow links, or explore new areas of the tree.
+
+## Rules
 - Cite specific Articles, Annexes, Recitals, and Chapters by name
 - Quote relevant text where helpful
 - If the tree lacks sufficient information, say so explicitly
+- NEVER make more than 5 tool calls in a single round
 """
 
 QUERY_TOOLS = [
@@ -331,47 +354,79 @@ async def query_agent(
     tree_id: str,
     sift: SiftTextClient,
     model: str = "openai/gpt-5.2",
-    max_turns: int = 20,
-) -> str:
+    max_turns: int = 10,
+    history: list[dict] | None = None,
+) -> tuple[str, list[dict]]:
     """Agentic query with read-only tree tools and streaming output.
 
     Level 1 streaming: tool call activity printed to stdout.
     Level 2 streaming: final answer tokens streamed to stdout.
-    Returns the full response text.
+    Returns (response_text, conversation_history) for multi-turn context.
     """
     client = get_client()
-    messages: list[dict] = [
-        {"role": "system", "content": QUERY_SYSTEM},
-        {"role": "user", "content": question},
-    ]
+    if history is not None:
+        # Continue prior conversation — append new user question
+        messages = history + [{"role": "user", "content": question}]
+    else:
+        messages = [
+            {"role": "system", "content": QUERY_SYSTEM},
+            {"role": "user", "content": question},
+        ]
 
     full_response = ""
     t0 = time.time()
 
-    for turn in range(max_turns):
-        stream = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=QUERY_TOOLS,
-            stream=True,
-        )
+    reasoning_kwargs = {"extra_body": {"reasoning": {"effort": "high"}}}
 
-        # Accumulate streamed response
+    def _stream_reasoning(rd, state: dict) -> list[dict]:
+        """Print reasoning tokens dimmed; return raw details for context preservation."""
+        raw: list[dict] = []
+        for detail in (rd if isinstance(rd, list) else [rd]):
+            text = detail.get("text", "") if isinstance(detail, dict) else str(detail)
+            if text:
+                if not state["in_reasoning"]:
+                    _console.print("\\[thinking] ", style="dim", end="", highlight=False)
+                    state["in_reasoning"] = True
+                _console.print(text, style="dim", end="", highlight=False)
+                state["reasoning_parts"].append(text)
+            if isinstance(detail, dict):
+                raw.append(detail)
+        return raw
+
+    def _end_reasoning(state: dict):
+        if state["in_reasoning"]:
+            _console.print()
+            state["in_reasoning"] = False
+
+    async def _collect_stream(stream, state: dict):
+        """Consume a streaming response, printing reasoning/tool activity dimmed.
+
+        Returns (content, tool_calls_list, reasoning_details_raw).
+        """
         content_parts: list[str] = []
+        reasoning_details_raw: list[dict] = []
         tool_calls_acc: dict[int, dict] = {}
+        state["in_reasoning"] = False
+        state["reasoning_parts"] = []
 
         async for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
 
-            # Level 2: stream content tokens to stdout immediately
+            # Reasoning traces (dimmed)
+            rd = getattr(delta, "reasoning_details", None) or getattr(delta, "reasoning", None)
+            if rd:
+                reasoning_details_raw.extend(_stream_reasoning(rd, state))
+
+            # Content tokens — accumulate silently (rendered as markdown later)
             if delta.content:
-                print(delta.content, end="", flush=True)
+                _end_reasoning(state)
                 content_parts.append(delta.content)
 
-            # Accumulate tool call deltas
+            # Tool call deltas
             if delta.tool_calls:
+                _end_reasoning(state)
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
                     if idx not in tool_calls_acc:
@@ -384,36 +439,54 @@ async def query_agent(
                         if tc_delta.function.arguments:
                             tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
 
-        content = "".join(content_parts)
+        _end_reasoning(state)
+
+        tc_list = [
+            {
+                "id": tc["id"],
+                "type": "function",
+                "function": {"name": tc["name"], "arguments": tc["arguments"]},
+            }
+            for tc in (tool_calls_acc[i] for i in sorted(tool_calls_acc))
+        ] if tool_calls_acc else []
+
+        return "".join(content_parts), tc_list, reasoning_details_raw
+
+    for turn in range(max_turns):
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=QUERY_TOOLS,
+            stream=True,
+            **reasoning_kwargs,
+        )
+
+        state: dict = {}
+        content, tc_list, reasoning_details_raw = await _collect_stream(stream, state)
 
         # ── Tool calls: execute and loop ──
-        if tool_calls_acc:
-            tc_list = [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
-                }
-                for tc in (tool_calls_acc[i] for i in sorted(tool_calls_acc))
-            ]
-            messages.append({
+        if tc_list:
+            assistant_msg: dict = {
                 "role": "assistant",
                 "content": content or None,
                 "tool_calls": tc_list,
-            })
+            }
+            if reasoning_details_raw:
+                assistant_msg["reasoning_details"] = reasoning_details_raw
+            messages.append(assistant_msg)
 
             for tc in tc_list:
                 name = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
 
-                # Level 1: show tool activity
+                # Tool activity (dimmed, highlight=False to avoid rich markup parsing)
                 if name == "search_tree":
-                    print(f"  [search] \"{args.get('query', '')}\"")
+                    _console.print(f"  \\[search] \"{args.get('query', '')}\"", style="dim", highlight=False)
                 elif name == "read_node":
-                    print(f"  [read]   {args.get('node_id', '')[:12]}...")
+                    _console.print(f"  \\[read]   {args.get('node_id', '')[:12]}...", style="dim", highlight=False)
                 elif name == "get_outline":
                     nid = args.get("node_id", "")
-                    print(f"  [outline] {nid[:12] + '...' if nid else '(root)'}")
+                    _console.print(f"  \\[outline] {nid[:12] + '...' if nid else '(root)'}", style="dim", highlight=False)
 
                 result = await _execute_query_tool(name, args, tree_id, sift)
                 messages.append({
@@ -422,10 +495,21 @@ async def query_agent(
                     "content": result,
                 })
 
+            # Nudge after 3 rounds of tool use
+            if turn >= 3:
+                messages.append({
+                    "role": "user",
+                    "content": "(You have done enough research. Please answer now based on what you have gathered.)",
+                })
+
             continue
 
-        # ── Final text response (already streamed above) ──
+        # ── Final text response: render as markdown ──
         full_response = content
+        if full_response.strip():
+            messages.append({"role": "assistant", "content": full_response})
+            _console.print()
+            _console.print(Markdown(full_response))
         break
     else:
         # Exhausted max_turns — force a final answer without tools
@@ -437,16 +521,16 @@ async def query_agent(
             model=model,
             messages=messages,
             stream=True,
+            **reasoning_kwargs,
         )
-        parts: list[str] = []
-        async for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                text = chunk.choices[0].delta.content
-                print(text, end="", flush=True)
-                parts.append(text)
-        full_response = "".join(parts)
+        state = {}
+        content, _, _ = await _collect_stream(stream, state)
+        full_response = content
+        if full_response.strip():
+            messages.append({"role": "assistant", "content": full_response})
+            _console.print()
+            _console.print(Markdown(full_response))
 
     dur = (time.time() - t0) * 1000
     perf.event("query_agent", dur, turns=turn + 1, model=model)
-    print()  # Trailing newline after streamed output
-    return full_response
+    return full_response, messages
