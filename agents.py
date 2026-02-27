@@ -70,15 +70,14 @@ between nodes. Use this structure to navigate, not shotgun keyword searches.
 
 **Step 1 — Orient:** Call get_outline() FIRST to see the tree's hierarchy. This is \
 your map. You'll see chapter names and section names with their IDs. Use this to \
-know WHERE to look. (1 call)
+know WHERE to look. It can be scoped to nodes to read subtrees.
 
-**Step 2 — Search & Read:** Do 1-2 targeted searches. Read the 2-4 most relevant \
+**Step 2 — Search & Read:** Do some targeted searches. Read the most relevant \
 nodes. IMPORTANT: when you read a node, check its <links> section — forward links, \
 see_also, and backlinks point to related nodes. Follow those links instead of \
-searching for the same content. (1-2 rounds)
+searching for the same content.
 
-**Step 3 — Answer:** After 2-3 rounds of tool calls, STOP and answer. A focused, \
-well-cited answer beats an exhaustive one. Do NOT keep searching for completeness.
+**Step 3 — Answer:** After sufficient rounds of tool calls, STOP and answer.
 
 ## Multi-turn conversations
 
@@ -87,11 +86,33 @@ preserved in context. Use information from earlier turns to inform follow-up ans
 — you don't need to re-fetch what you already have, but you CAN use any tool at any \
 time to dig deeper, follow links, or explore new areas of the tree.
 
+## How to write your answers
+
+Write like a sharp colleague explaining something in a conversation — direct, clear, \
+and easy to follow. NO numbered lists, NO bullet-point dumps. Use short paragraphs \
+(2-4 sentences each). Each paragraph should make ONE point and land it.
+
+Use **bold text** to flag key terms, article references, or the core takeaway of a \
+paragraph so a reader scanning gets the shape of your answer before reading in full. \
+Think of bold phrases as signposts through the explanation.
+
+Explain substance over structure — the reasoning behind provisions, how parts of the \
+regulation interact, practical implications. Don't just state requirements; explain \
+what they mean and why they matter.
+
+Cite Articles, Annexes, Recitals, and Chapters inline (e.g., "Under **Article 6(1)**, \
+..."). Quote relevant text where it sharpens the point. Let citations support the \
+narrative, not structure it.
+
+When a question touches multiple areas, call out where things go deeper — give the \
+reader a thread to pull on next. Keep the whole response digestible: if you find \
+yourself writing a paragraph longer than 4 sentences, break it up.
+
+If the tree lacks sufficient information on a point, say so explicitly.
+
 ## Rules
-- Cite specific Articles, Annexes, Recitals, and Chapters by name
-- Quote relevant text where helpful
-- If the tree lacks sufficient information, say so explicitly
-- NEVER make more than 5 tool calls in a single round
+- NEVER use numbered lists. Avoid bullet points. Write in short paragraphs.
+- Use **bold** liberally to make key points scannable.
 """
 
 QUERY_TOOLS = [
@@ -513,13 +534,6 @@ async def query_agent(
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result,
-                })
-
-            # Nudge after 3 rounds of tool use
-            if turn >= 3:
-                messages.append({
-                    "role": "user",
-                    "content": "(You have done enough research. Please answer now based on what you have gathered.)",
                 })
 
             continue
