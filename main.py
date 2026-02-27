@@ -9,17 +9,16 @@ import time
 from dotenv import load_dotenv
 
 from chunk import chunk_pdf
+from perf import perf
 from sifttext import SiftTextClient
 from agents import triage_agent, linkage_agent, query_agent
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
-_T0 = 0.0
-
 
 def _ts() -> str:
     """Return elapsed time as [MM:SS]."""
-    elapsed = time.time() - _T0
+    elapsed = time.time() - perf._t0
     m, s = divmod(int(elapsed), 60)
     return f"[{m:02d}:{s:02d}]"
 
@@ -31,8 +30,7 @@ def _banner(stage: int, title: str):
 
 
 async def main():
-    global _T0
-    _T0 = time.time()
+    perf.start()
     load_dotenv()
 
     for var in ("SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"):
@@ -45,6 +43,7 @@ async def main():
     try:
         # Stage 0: Chunk PDF
         _banner(0, "Chunking PDF")
+        perf.stage("0_chunking")
         chunks = chunk_pdf(args.pdf)
         level1 = [c for c in chunks if c["level"] == 1]
         level2 = [c for c in chunks if c["level"] == 2]
@@ -52,6 +51,7 @@ async def main():
 
         # Stage 1: Create tree
         _banner(1, "Creating Knowledge Tree")
+        perf.stage("1_tree_creation")
         tree = await sift.create_tree("EU AI Act Analysis", "Parallel decomposition of EU AI Act")
         tree_id = tree["tree_id"]
         root_id = tree["root_id"]
@@ -60,25 +60,40 @@ async def main():
         # Stage 2: Two-pass hierarchical creation
         _banner(2, "Building Document Structure")
 
-        # Pass 1 — structural parent nodes (no LLM, fast)
-        print(f"{_ts()}   Pass 1: Creating {len(level1)} parent nodes...")
+        # Pass 1 — structural parent nodes (parallel, no LLM)
+        perf.stage("2a_parent_nodes")
+        print(f"{_ts()}   Pass 1: Creating {len(level1)} parent nodes (parallel)...")
         parent_node_ids: dict[str, str] = {}
+        p1_sem = asyncio.Semaphore(10)
 
-        for i, chunk in enumerate(level1, 1):
-            result_text = await sift.create_node(
-                name=chunk["title"],
-                scope=chunk["text"][:200] if chunk["text"] else chunk["title"],
-                parent_id=root_id,
-                tree_id=tree_id,
-            )
+        async def _create_parent(i: int, chunk: dict) -> tuple[str, str | None]:
+            async with p1_sem:
+                result_text = await sift.create_node(
+                    name=chunk["title"],
+                    scope=chunk["text"][:200] if chunk["text"] else chunk["title"],
+                    parent_id=root_id,
+                    tree_id=tree_id,
+                    pipeline_mode=True,
+                )
             match = _UUID_RE.search(result_text)
-            if match:
-                parent_node_ids[chunk["title"]] = match.group(0)
+            nid = match.group(0) if match else None
             print(f"{_ts()}     [{i}/{len(level1)}] {chunk['title']}")
+            return chunk["title"], nid
+
+        p1_results = await asyncio.gather(
+            *[_create_parent(i, c) for i, c in enumerate(level1, 1)],
+            return_exceptions=True,
+        )
+        for r in p1_results:
+            if isinstance(r, tuple):
+                title, nid = r
+                if nid:
+                    parent_node_ids[title] = nid
 
         print(f"{_ts()}   Pass 1 complete: {len(parent_node_ids)} parent nodes created")
 
         # Pass 2 — triage level-2 chunks under parents (parallel, with LLM)
+        perf.stage("2b_triage")
         print(f"\n{_ts()}   Pass 2: Triaging {len(level2)} sections with LLM (concurrency=10)...")
         sem = asyncio.Semaphore(10)
         counter = {"done": 0}
@@ -87,13 +102,13 @@ async def main():
             parent_id = parent_node_ids.get(chunk["parent_title"], root_id)
             try:
                 async with sem:
-                    result = await triage_agent(chunk, tree_id, parent_id, sift, args.model)
+                    result = await triage_agent(chunk, tree_id, parent_id, sift, args.model, pipeline_mode=True)
             except Exception:
                 counter["done"] += 1
-                print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} \u2717")
+                print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} ✗")
                 raise
             counter["done"] += 1
-            print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} \u2713")
+            print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} ✓")
             return result
 
         tasks = [rate_limited_triage(c) for c in level2]
@@ -112,18 +127,25 @@ async def main():
 
         # Stage 3: Linkage pass
         _banner(3, "Cross-Reference Linkage")
+        perf.stage("3_linkage")
         try:
-            link_count = await linkage_agent(tree_id, sift, args.smart_model)
+            link_count = await linkage_agent(tree_id, sift, args.smart_model, pipeline_mode=True)
             print(f"{_ts()}   Linkage complete: {link_count} cross-references added")
         except Exception as e:
             print(f"{_ts()}   ! Linkage failed ({type(e).__name__}: {e}), continuing")
 
+        # Finish profiling and print summary
+        perf.finish()
+        perf.summary()
+        log_path = perf.save()
+
         # Summary
-        total = time.time() - _T0
+        total = time.time() - perf._t0
         m, s = divmod(int(total), 60)
         print(f"\n{'=' * 60}")
         print(f"  Pipeline complete in {m}m {s}s")
         print(f"  {len(parent_node_ids)} chapters | {successes} sections | tree {tree_id[:8]}...")
+        print(f"  Perf log: {log_path}")
         print(f"{'=' * 60}")
 
         # Stage 4: Interactive query loop

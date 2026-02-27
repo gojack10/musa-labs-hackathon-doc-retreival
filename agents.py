@@ -4,6 +4,7 @@ import asyncio
 import re
 
 from llm import complete
+from perf import perf
 from sifttext import SiftTextClient
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -72,6 +73,7 @@ async def triage_agent(
     parent_id: str,
     sift: SiftTextClient,
     model: str = "openai/gpt-5.2-chat",
+    pipeline_mode: bool = False,
 ) -> str:
     """Analyze a document chunk via LLM and create a SiftText node.
 
@@ -84,6 +86,7 @@ async def triage_agent(
             scope=f"Section header for {chunk['title']}",
             parent_id=parent_id,
             tree_id=tree_id,
+            pipeline_mode=pipeline_mode,
         )
         match = _UUID_RE.search(result)
         return match.group(0) if match else ""
@@ -105,6 +108,7 @@ async def triage_agent(
         parent_id=parent_id,
         tree_id=tree_id,
         crystallization=crystallization,
+        pipeline_mode=pipeline_mode,
     )
 
     match = _UUID_RE.search(result)
@@ -116,6 +120,9 @@ async def linkage_agent(
     sift: SiftTextClient,
     model: str = "openai/gpt-5.2",
     max_nodes: int | None = None,
+    llm_concurrency: int = 4,
+    link_concurrency: int = 20,
+    pipeline_mode: bool = False,
 ) -> int:
     """Read tree structure and add cross-reference links between nodes.
 
@@ -128,11 +135,11 @@ async def linkage_agent(
     if max_nodes:
         node_ids = node_ids[:max_nodes]
 
-    # Read all nodes in parallel (semaphore to avoid hammering API)
-    sem = asyncio.Semaphore(20)
+    # Read all nodes in parallel
+    read_sem = asyncio.Semaphore(20)
 
     async def _read_node(nid: str) -> dict:
-        async with sem:
+        async with read_sem:
             content = await sift.get_node(nid)
         name_match = re.search(r"<name>(.*?)</name>", content)
         name = name_match.group(1) if name_match else nid
@@ -146,19 +153,26 @@ async def linkage_agent(
     if read_failures:
         print(f"  Warning: {len(read_failures)} node reads failed")
 
+    perf.event("linkage_read_nodes", 0, nodes_read=len(nodes), failures=len(read_failures))
+
     # Build name -> id lookup for link resolution
     name_to_id: dict[str, str] = {n["name"]: n["id"] for n in nodes}
 
-    # Process in batches of 8 — collect link tasks across all batches
+    # --- Build all batches upfront ---
     batch_size = 8
-    pending_links: list[dict] = []
-    total_batches = (len(nodes) + batch_size - 1) // batch_size
-
+    batches: list[tuple[int, list[dict]]] = []
     for i in range(0, len(nodes), batch_size):
         batch = nodes[i : i + batch_size]
-        batch_num = i // batch_size + 1
-        print(f"  Batch {batch_num}/{total_batches}: analyzing {len(batch)} nodes...")
+        batches.append((i // batch_size + 1, batch))
+    total_batches = len(batches)
 
+    # --- Process batches with LLM concurrency ---
+    llm_sem = asyncio.Semaphore(llm_concurrency)
+    all_pending_links: list[dict] = []
+    link_lock = asyncio.Lock()
+
+    async def _process_batch(batch_num: int, batch: list[dict]) -> int:
+        """Analyze one batch via LLM, return count of links found."""
         batch_text = ""
         for node in batch:
             cryst_match = re.search(
@@ -167,18 +181,21 @@ async def linkage_agent(
             cryst = cryst_match.group(1).strip()[:2000] if cryst_match else ""
             batch_text += f"\n### {node['name']}\n{cryst}\n"
 
-        try:
-            llm_output = await complete(
-                system=LINKAGE_SYSTEM.format(outline=outline),
-                user=f"Analyze these nodes for cross-references:\n{batch_text}",
-                model=model,
-            )
-        except Exception as e:
-            print(f"  Batch {batch_num}/{total_batches}: failed ({e})")
-            continue
+        async with llm_sem:
+            try:
+                llm_output = await complete(
+                    system=LINKAGE_SYSTEM.format(outline=outline),
+                    user=f"Analyze these nodes for cross-references:\n{batch_text}",
+                    model=model,
+                )
+            except Exception as e:
+                print(f"  Batch {batch_num}/{total_batches}: failed ({e})")
+                perf.event("linkage_batch", 0, success=False, batch=batch_num,
+                           error=str(e))
+                return 0
 
-        # Parse "SOURCE_TITLE -> TARGET_TITLE | reason" lines
-        batch_links = 0
+        # Parse links
+        batch_links: list[dict] = []
         for line in llm_output.strip().split("\n"):
             if " -> " not in line or " | " not in line:
                 continue
@@ -191,27 +208,46 @@ async def linkage_agent(
             if not source_id:
                 continue
 
-            pending_links.append({
+            target_id = name_to_id.get(target_title)
+            batch_links.append({
                 "source_node_id": source_id,
                 "target_name": target_title,
                 "description": reason.strip(),
+                **({"target_node_id": target_id} if target_id else {}),
             })
-            batch_links += 1
-        print(f"  Batch {batch_num}/{total_batches}: found {batch_links} links")
+
+        async with link_lock:
+            all_pending_links.extend(batch_links)
+
+        count = len(batch_links)
+        print(f"  Batch {batch_num}/{total_batches}: {count} links found")
+        perf.event("linkage_batch", 0, batch=batch_num, links_found=count)
+        return count
+
+    # Fire all batches concurrently (limited by llm_sem)
+    batch_results = await asyncio.gather(
+        *[_process_batch(num, batch) for num, batch in batches],
+        return_exceptions=True,
+    )
+    total_found = sum(r for r in batch_results if isinstance(r, int))
+    print(f"  {total_found} links found across {total_batches} batches")
 
     # Create all links in parallel
-    print(f"  Creating {len(pending_links)} links in parallel...")
+    resolved = sum(1 for l in all_pending_links if "target_node_id" in l)
+    print(f"  Creating {len(all_pending_links)} links ({resolved} locally resolved, "
+          f"{len(all_pending_links) - resolved} server-side)...")
+    link_sem = asyncio.Semaphore(link_concurrency)
 
     async def _create_link(link: dict) -> bool:
-        async with sem:
+        async with link_sem:
             try:
-                await sift.link_by_name(**link)
+                await sift.link_by_name(**link, pipeline_mode=pipeline_mode)
                 return True
             except Exception:
                 return False
 
     link_results = await asyncio.gather(
-        *[_create_link(lnk) for lnk in pending_links], return_exceptions=True
+        *[_create_link(lnk) for lnk in all_pending_links], return_exceptions=True
     )
     links_added = sum(1 for r in link_results if r is True)
 
@@ -234,9 +270,8 @@ async def query_agent(
     if not result_ids:
         return "No relevant sections found in the document tree for this question."
 
-    # Read each matching node
-    context_parts: list[str] = []
-    for nid in result_ids:
+    # Read matching nodes in parallel
+    async def _read(nid: str) -> tuple[str, str]:
         content = await sift.get_node(nid)
         name_match = re.search(r"<name>(.*?)</name>", content)
         cryst_match = re.search(
@@ -244,7 +279,10 @@ async def query_agent(
         )
         name = name_match.group(1) if name_match else nid
         cryst = cryst_match.group(1).strip() if cryst_match else ""
-        context_parts.append(f"### {name}\n{cryst}")
+        return name, cryst
+
+    results = await asyncio.gather(*[_read(nid) for nid in result_ids])
+    context_parts = [f"### {name}\n{cryst}" for name, cryst in results]
 
     context = "\n\n---\n\n".join(context_parts)
 
