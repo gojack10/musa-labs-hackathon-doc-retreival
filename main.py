@@ -1,4 +1,4 @@
-"""Orchestrator: chunk PDF -> create tree -> parallel triage -> linkage -> query loop."""
+"""Orchestrator: chunk markdown -> create tree -> parallel triage -> linkage -> query loop."""
 
 import asyncio
 import argparse
@@ -8,7 +8,7 @@ import time
 
 from dotenv import load_dotenv
 
-from chunk import chunk_pdf
+from chunk import chunk_markdown
 from perf import perf
 from sifttext import SiftTextClient
 from rich.console import Console
@@ -48,13 +48,13 @@ async def main():
             # Skip pipeline, jump straight to query loop
             tree_id = args.query_only
         else:
-            # Stage 0: Chunk PDF
-            _banner(0, "Chunking PDF")
+            # Stage 0: Chunk markdown
+            _banner(0, "Chunking Markdown")
             perf.stage("0_chunking")
-            chunks = chunk_pdf(args.pdf)
+            chunks = chunk_markdown(args.input)
             level1 = [c for c in chunks if c["level"] == 1]
-            level2 = [c for c in chunks if c["level"] == 2]
-            print(f"{_ts()}   {len(chunks)} chunks extracted ({len(level1)} parents, {len(level2)} children)")
+            level2_plus = [c for c in chunks if c["level"] >= 2]
+            print(f"{_ts()}   {len(chunks)} chunks extracted ({len(level1)} parents, {len(level2_plus)} children)")
 
             # Stage 1: Create tree
             _banner(1, "Creating Knowledge Tree")
@@ -101,7 +101,7 @@ async def main():
 
             # Pass 2 — triage level-2 chunks under parents (parallel, with LLM)
             perf.stage("2b_triage")
-            print(f"\n{_ts()}   Pass 2: Triaging {len(level2)} sections with LLM (concurrency=10)...")
+            print(f"\n{_ts()}   Pass 2: Triaging {len(level2_plus)} sections with LLM (concurrency=10)...")
             sem = asyncio.Semaphore(10)
             counter = {"done": 0}
 
@@ -112,13 +112,13 @@ async def main():
                         result = await triage_agent(chunk, tree_id, parent_id, sift, args.model, pipeline_mode=True)
                 except Exception:
                     counter["done"] += 1
-                    print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} ✗")
+                    print(f"{_ts()}     [{counter['done']}/{len(level2_plus)}] {chunk['title']} ✗")
                     raise
                 counter["done"] += 1
-                print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} ✓")
+                print(f"{_ts()}     [{counter['done']}/{len(level2_plus)}] {chunk['title']} ✓")
                 return result
 
-            tasks = [rate_limited_triage(c) for c in level2]
+            tasks = [rate_limited_triage(c) for c in level2_plus]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             failures = [r for r in results if isinstance(r, Exception)]
@@ -181,7 +181,7 @@ async def main():
 
 def parse_args():
     p = argparse.ArgumentParser(description="Enterprise Doc Agent")
-    p.add_argument("--pdf", default="eu_ai_act.pdf", help="Path to PDF file")
+    p.add_argument("--input", default="eu_ai_act.md", help="Path to markdown file")
     p.add_argument("--model", default="openai/gpt-5.2-chat", help="Triage model")
     p.add_argument("--smart-model", default="openai/gpt-5.2", help="Linkage/query model")
     p.add_argument("--query-only", metavar="TREE_ID",
