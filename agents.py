@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 
@@ -59,61 +60,16 @@ Only output links where the source text explicitly references the target. \
 Do not infer implicit connections. If no links exist for a node, skip it.
 """
 
-QUERY_SYSTEM = """\
-You are an expert on the EU AI Act (Regulation (EU) 2024/1689). You have access to \
-a structured knowledge tree containing the full text and analysis of the regulation.
+_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "prompt.md")
 
-## How to use the tree
 
-The tree has EXPLICIT structure — chapters, sections, and cross-reference links \
-between nodes. Use this structure to navigate, not shotgun keyword searches.
-
-**Step 1 — Orient:** Call get_outline() FIRST to see the tree's hierarchy. This is \
-your map. You'll see chapter names and section names with their IDs. Use this to \
-know WHERE to look. It can be scoped to nodes to read subtrees.
-
-**Step 2 — Search & Read:** Do some targeted searches. Read the most relevant \
-nodes. IMPORTANT: when you read a node, check its <links> section — forward links, \
-see_also, and backlinks point to related nodes. Follow those links instead of \
-searching for the same content.
-
-**Step 3 — Answer:** After sufficient rounds of tool calls, STOP and answer.
-
-## Multi-turn conversations
-
-This is a multi-turn conversation. Prior questions, tool results, and answers are \
-preserved in context. Use information from earlier turns to inform follow-up answers \
-— you don't need to re-fetch what you already have, but you CAN use any tool at any \
-time to dig deeper, follow links, or explore new areas of the tree.
-
-## How to write your answers
-
-Write like a sharp colleague explaining something in a conversation — direct, clear, \
-and easy to follow. NO numbered lists, NO bullet-point dumps. Use short paragraphs \
-(2-4 sentences each). Each paragraph should make ONE point and land it.
-
-Use **bold text** to flag key terms, article references, or the core takeaway of a \
-paragraph so a reader scanning gets the shape of your answer before reading in full. \
-Think of bold phrases as signposts through the explanation.
-
-Explain substance over structure — the reasoning behind provisions, how parts of the \
-regulation interact, practical implications. Don't just state requirements; explain \
-what they mean and why they matter.
-
-Cite Articles, Annexes, Recitals, and Chapters inline (e.g., "Under **Article 6(1)**, \
-..."). Quote relevant text where it sharpens the point. Let citations support the \
-narrative, not structure it.
-
-When a question touches multiple areas, call out where things go deeper — give the \
-reader a thread to pull on next. Keep the whole response digestible: if you find \
-yourself writing a paragraph longer than 4 sentences, break it up.
-
-If the tree lacks sufficient information on a point, say so explicitly.
-
-## Rules
-- NEVER use numbered lists. Avoid bullet points. Write in short paragraphs.
-- Use **bold** liberally to make key points scannable.
-"""
+def _load_query_system() -> str:
+    """Load query system prompt from prompt.md, falling back to a minimal default."""
+    try:
+        with open(_PROMPT_PATH) as f:
+            return f.read()
+    except FileNotFoundError:
+        return "Answer questions using the knowledge tree. You MUST read_node before citing content."
 
 QUERY_TOOLS = [
     {
@@ -391,12 +347,15 @@ async def query_agent(
         messages = history + [{"role": "user", "content": question}]
     else:
         messages = [
-            {"role": "system", "content": QUERY_SYSTEM},
+            {"role": "system", "content": _load_query_system()},
             {"role": "user", "content": question},
         ]
 
     full_response = ""
     t0 = time.time()
+    node_names: dict[str, str] = {}   # node_id → name cache
+    linked_ids: set[str] = set()      # IDs seen in <links> sections
+    cited_ids: list[str] = []         # read_node targets, in order
 
     reasoning_kwargs = {}  # Azure OpenAI — no extra_body reasoning
 
@@ -424,17 +383,24 @@ async def query_agent(
         """Consume a streaming response, printing reasoning/tool activity dimmed.
 
         Content tokens are progressively rendered as rich Markdown via Live.
-        Returns (content, tool_calls_list, reasoning_details_raw).
+        Returns (content, tool_calls_list, reasoning_details_raw, usage_dict).
         """
         content_parts: list[str] = []
         reasoning_details_raw: list[dict] = []
         tool_calls_acc: dict[int, dict] = {}
+        usage: dict = {}
         state["in_reasoning"] = False
         state["reasoning_parts"] = []
         live: Live | None = None
 
         try:
             async for chunk in stream:
+                # Capture usage from final chunk
+                if chunk.usage:
+                    usage = {
+                        "input": chunk.usage.prompt_tokens or 0,
+                        "output": chunk.usage.completion_tokens or 0,
+                    }
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
@@ -491,7 +457,9 @@ async def query_agent(
             for tc in (tool_calls_acc[i] for i in sorted(tool_calls_acc))
         ] if tool_calls_acc else []
 
-        return "".join(content_parts), tc_list, reasoning_details_raw
+        return "".join(content_parts), tc_list, reasoning_details_raw, usage
+
+    total_usage = {"input": 0, "output": 0}
 
     for turn in range(max_turns):
         stream = await client.chat.completions.create(
@@ -499,11 +467,14 @@ async def query_agent(
             messages=messages,
             tools=QUERY_TOOLS,
             stream=True,
+            stream_options={"include_usage": True},
             **reasoning_kwargs,
         )
 
         state: dict = {}
-        content, tc_list, reasoning_details_raw = await _collect_stream(stream, state)
+        content, tc_list, reasoning_details_raw, usage = await _collect_stream(stream, state)
+        total_usage["input"] += usage.get("input", 0)
+        total_usage["output"] += usage.get("output", 0)
 
         # ── Tool calls: execute and loop ──
         if tc_list:
@@ -517,19 +488,58 @@ async def query_agent(
             messages.append(assistant_msg)
 
             for tc in tc_list:
-                name = tc["function"]["name"]
+                fname = tc["function"]["name"]
                 args = json.loads(tc["function"]["arguments"])
+                result = await _execute_query_tool(fname, args, tree_id, sift)
 
-                # Tool activity (dimmed, highlight=False to avoid rich markup parsing)
-                if name == "search_tree":
+                # Extract node names from results into cache
+                if fname in ("read_node", "get_outline", "search_tree"):
+                    # XML format: id="UUID"><name>...</name>
+                    for nid, nname in re.findall(
+                        r'id="([0-9a-f-]{36})">\s*<name>([^<]+)</name>', result
+                    ):
+                        node_names[nid] = nname
+                    # Outline plaintext: UUID status Name (children)
+                    for nid, nname in re.findall(
+                        r'([0-9a-f-]{36})\s+\S+\s{2,3}(.+?)(?:\s+\(\d+\))?$',
+                        result, re.MULTILINE,
+                    ):
+                        nname = nname.strip()
+                        if nname and nid not in node_names:
+                            node_names[nid] = nname
+                if fname == "read_node":
+                    # Collect linked IDs for link-traversal detection
+                    for lid in _UUID_RE.findall(
+                        re.search(r"<links>(.*?)</links>", result, re.DOTALL).group(1)
+                        if re.search(r"<links>(.*?)</links>", result, re.DOTALL) else ""
+                    ):
+                        linked_ids.add(lid)
+
+                # Tool activity display (after execution so we have names)
+                if fname == "search_tree":
                     _console.print(f"  \\[search] \"{args.get('query', '')}\"", style="dim", highlight=False)
-                elif name == "read_node":
-                    _console.print(f"  \\[read]   {args.get('node_id', '')[:12]}...", style="dim", highlight=False)
-                elif name == "get_outline":
+                elif fname == "read_node":
                     nid = args.get("node_id", "")
-                    _console.print(f"  \\[outline] {nid[:12] + '...' if nid else '(root)'}", style="dim", highlight=False)
+                    nname = node_names.get(nid, "")
+                    label = f"{nname} ({nid[:8]}…)" if nname else f"{nid[:12]}…"
+                    via = ""
+                    if nid in linked_ids:
+                        via = " → via link"
+                    _console.print(f"  \\[read] {label}", style="dim", end="", highlight=False)
+                    if via:
+                        _console.print(via, style="blue", end="", highlight=False)
+                    _console.print()
+                    if nid not in cited_ids:
+                        cited_ids.append(nid)
+                elif fname == "get_outline":
+                    nid = args.get("node_id", "")
+                    nname = node_names.get(nid, "")
+                    if nid:
+                        label = f"{nname} ({nid[:8]}…)" if nname else f"{nid[:12]}…"
+                    else:
+                        label = "(root)"
+                    _console.print(f"  \\[outline] {label}", style="dim", highlight=False)
 
-                result = await _execute_query_tool(name, args, tree_id, sift)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
@@ -553,13 +563,33 @@ async def query_agent(
             model=model,
             messages=messages,
             stream=True,
+            stream_options={"include_usage": True},
             **reasoning_kwargs,
         )
         state = {}
-        content, _, _ = await _collect_stream(stream, state)
+        content, _, _, usage = await _collect_stream(stream, state)
+        total_usage["input"] += usage.get("input", 0)
+        total_usage["output"] += usage.get("output", 0)
         full_response = content
         if full_response.strip():
             messages.append({"role": "assistant", "content": full_response})
+
+    # ── Citation footer ──
+    if cited_ids:
+        _console.print()
+        _console.print("  Sources:", style="dim")
+        names = []
+        for cid in cited_ids:
+            cname = node_names.get(cid, cid[:12] + "…")
+            names.append(cname)
+        _console.print("  " + "  ·  ".join(f"[italic blue]{n}[/]" for n in names))
+
+    # ── Token usage ──
+    if total_usage["input"] or total_usage["output"]:
+        _console.print(
+            f"  tokens: {total_usage['input']:,} in · {total_usage['output']:,} out",
+            style="dim",
+        )
 
     dur = (time.time() - t0) * 1000
     perf.event("query_agent", dur, turns=turn + 1, model=model)

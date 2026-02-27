@@ -20,3 +20,6 @@ runs/
 
 # Doom source
 doom-src/
+
+# Query agent prompt
+prompt.md
