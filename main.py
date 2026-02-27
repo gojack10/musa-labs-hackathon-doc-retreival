@@ -11,7 +11,10 @@ from dotenv import load_dotenv
 from chunk import chunk_pdf
 from perf import perf
 from sifttext import SiftTextClient
+from rich.console import Console
 from agents import triage_agent, linkage_agent, query_agent
+
+_console = Console()
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -159,7 +162,8 @@ async def main():
         history: list[dict] | None = None
         try:
             while True:
-                q = await asyncio.to_thread(input, "> ")
+                _console.print("> ", style="green", end="")
+                q = await asyncio.to_thread(input)
                 if not q.strip():
                     continue
                 print()

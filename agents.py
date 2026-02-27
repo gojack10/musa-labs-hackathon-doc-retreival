@@ -6,6 +6,7 @@ import re
 import time
 
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
 
 from llm import complete, get_client
@@ -382,7 +383,7 @@ async def query_agent(
         """Print reasoning tokens dimmed; return raw details for context preservation."""
         raw: list[dict] = []
         for detail in (rd if isinstance(rd, list) else [rd]):
-            text = detail.get("text", "") if isinstance(detail, dict) else str(detail)
+            text = (detail.get("text") or detail.get("summary", "")) if isinstance(detail, dict) else str(detail)
             if text:
                 if not state["in_reasoning"]:
                     _console.print("\\[thinking] ", style="dim", end="", highlight=False)
@@ -401,6 +402,7 @@ async def query_agent(
     async def _collect_stream(stream, state: dict):
         """Consume a streaming response, printing reasoning/tool activity dimmed.
 
+        Content tokens are progressively rendered as rich Markdown via Live.
         Returns (content, tool_calls_list, reasoning_details_raw).
         """
         content_parts: list[str] = []
@@ -408,38 +410,56 @@ async def query_agent(
         tool_calls_acc: dict[int, dict] = {}
         state["in_reasoning"] = False
         state["reasoning_parts"] = []
+        live: Live | None = None
 
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
+        try:
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
 
-            # Reasoning traces (dimmed)
-            rd = getattr(delta, "reasoning_details", None) or getattr(delta, "reasoning", None)
-            if rd:
-                reasoning_details_raw.extend(_stream_reasoning(rd, state))
+                # Reasoning traces (dimmed)
+                # OpenRouter sends reasoning_details, but the OpenAI SDK's
+                # ChoiceDelta Pydantic model doesn't define it — check model_extra.
+                extras = getattr(delta, "model_extra", None) or {}
+                rd = (
+                    extras.get("reasoning_details")
+                    or extras.get("reasoning")
+                    or getattr(delta, "reasoning_content", None)
+                    or getattr(delta, "reasoning", None)
+                )
+                if rd:
+                    reasoning_details_raw.extend(_stream_reasoning(rd, state))
 
-            # Content tokens — accumulate silently (rendered as markdown later)
-            if delta.content:
-                _end_reasoning(state)
-                content_parts.append(delta.content)
+                # Content tokens — progressively render as markdown
+                if delta.content:
+                    _end_reasoning(state)
+                    content_parts.append(delta.content)
+                    if live is None:
+                        live = Live(Markdown("".join(content_parts)), console=_console, refresh_per_second=8)
+                        live.start()
+                    else:
+                        live.update(Markdown("".join(content_parts)))
 
-            # Tool call deltas
-            if delta.tool_calls:
-                _end_reasoning(state)
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc_delta.id:
-                        tool_calls_acc[idx]["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            tool_calls_acc[idx]["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+                # Tool call deltas
+                if delta.tool_calls:
+                    _end_reasoning(state)
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                        if tc_delta.id:
+                            tool_calls_acc[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                tool_calls_acc[idx]["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
 
-        _end_reasoning(state)
+            _end_reasoning(state)
+        finally:
+            if live is not None:
+                live.stop()
 
         tc_list = [
             {
@@ -504,12 +524,10 @@ async def query_agent(
 
             continue
 
-        # ── Final text response: render as markdown ──
+        # ── Final text response (already rendered via Live) ──
         full_response = content
         if full_response.strip():
             messages.append({"role": "assistant", "content": full_response})
-            _console.print()
-            _console.print(Markdown(full_response))
         break
     else:
         # Exhausted max_turns — force a final answer without tools
@@ -528,8 +546,6 @@ async def query_agent(
         full_response = content
         if full_response.strip():
             messages.append({"role": "assistant", "content": full_response})
-            _console.print()
-            _console.print(Markdown(full_response))
 
     dur = (time.time() - t0) * 1000
     perf.event("query_agent", dur, turns=turn + 1, model=model)
