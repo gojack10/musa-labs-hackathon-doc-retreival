@@ -20,6 +20,11 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def get_client() -> AsyncOpenAI:
+    """Get or create the shared AsyncOpenAI client."""
+    return _get_client()
+
+
 async def complete(
     system: str, user: str, model: str = "openai/gpt-5.2"
 ) -> str:

@@ -1,9 +1,11 @@
 """Agent functions: triage, linkage, and query over SiftText trees."""
 
 import asyncio
+import json
 import re
+import time
 
-from llm import complete
+from llm import complete, get_client
 from perf import perf
 from sifttext import SiftTextClient
 
@@ -52,19 +54,75 @@ Do not infer implicit connections. If no links exist for a node, skip it.
 """
 
 QUERY_SYSTEM = """\
-You are an expert on the EU AI Act. Answer the user's question using ONLY the \
-provided context from the structured document tree. Cite specific articles, \
-annexes, and recitals by name.
+You are an expert on the EU AI Act (Regulation (EU) 2024/1689). You have access to \
+a structured knowledge tree containing the full text and analysis of the regulation.
 
-Context from document tree:
-{context}
+Use your tools to research the tree before answering:
+1. Search for terms related to the question
+2. Read relevant nodes for detailed content and cross-references
+3. Follow links to related sections when needed
+4. Synthesize a grounded answer
 
 Rules:
-- Ground every claim in a specific node from the context
+- Always use tools to find information — do not rely on prior knowledge
+- Cite specific Articles, Annexes, Recitals, and Chapters by name
 - Quote relevant text where helpful
-- If the context doesn't contain enough information, say so explicitly
-- Reference nodes by their title (e.g., "According to Article 6...")
+- If the tree lacks sufficient information, say so explicitly
 """
+
+QUERY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_tree",
+            "description": "Search the EU AI Act knowledge tree. Returns ranked results with node IDs, names, and relevance snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": 'Search query. Supports prefix*, boolean OR/NOT, and "exact phrases".',
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_node",
+            "description": "Read full content of a node: scope, crystallization (structured analysis), cross-reference links, and children summary.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "UUID of the node to read",
+                    }
+                },
+                "required": ["node_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_outline",
+            "description": "Get tree structure showing node hierarchy with names and IDs. Use to understand document organization or browse into a subtree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "Optional: focus on subtree rooted at this node. Omit for top-level overview.",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+]
 
 
 async def triage_agent(
@@ -254,40 +312,141 @@ async def linkage_agent(
     return links_added
 
 
+async def _execute_query_tool(
+    name: str, args: dict, tree_id: str, sift: SiftTextClient
+) -> str:
+    """Execute a read-only tree tool and return the result text."""
+    if name == "search_tree":
+        return await sift.search(args["query"], tree_id)
+    elif name == "read_node":
+        return await sift.get_node(args["node_id"])
+    elif name == "get_outline":
+        node_id = args.get("node_id")
+        return await sift.get_outline(tree_id, max_depth=2, node_id=node_id)
+    return f"Unknown tool: {name}"
+
+
 async def query_agent(
     question: str,
     tree_id: str,
     sift: SiftTextClient,
     model: str = "openai/gpt-5.2",
+    max_turns: int = 20,
 ) -> str:
-    """Search the tree and answer a question with grounded citations."""
-    # Search for relevant nodes
-    search_results = await sift.search(question, tree_id)
+    """Agentic query with read-only tree tools and streaming output.
 
-    # Extract node IDs from search results (top 5)
-    result_ids = _UUID_RE.findall(search_results)[:5]
+    Level 1 streaming: tool call activity printed to stdout.
+    Level 2 streaming: final answer tokens streamed to stdout.
+    Returns the full response text.
+    """
+    client = get_client()
+    messages: list[dict] = [
+        {"role": "system", "content": QUERY_SYSTEM},
+        {"role": "user", "content": question},
+    ]
 
-    if not result_ids:
-        return "No relevant sections found in the document tree for this question."
+    full_response = ""
+    t0 = time.time()
 
-    # Read matching nodes in parallel
-    async def _read(nid: str) -> tuple[str, str]:
-        content = await sift.get_node(nid)
-        name_match = re.search(r"<name>(.*?)</name>", content)
-        cryst_match = re.search(
-            r"<crystallization>(.*?)</crystallization>", content, re.DOTALL
+    for turn in range(max_turns):
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=QUERY_TOOLS,
+            stream=True,
         )
-        name = name_match.group(1) if name_match else nid
-        cryst = cryst_match.group(1).strip() if cryst_match else ""
-        return name, cryst
 
-    results = await asyncio.gather(*[_read(nid) for nid in result_ids])
-    context_parts = [f"### {name}\n{cryst}" for name, cryst in results]
+        # Accumulate streamed response
+        content_parts: list[str] = []
+        tool_calls_acc: dict[int, dict] = {}
 
-    context = "\n\n---\n\n".join(context_parts)
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
 
-    return await complete(
-        system=QUERY_SYSTEM.format(context=context),
-        user=question,
-        model=model,
-    )
+            # Level 2: stream content tokens to stdout immediately
+            if delta.content:
+                print(delta.content, end="", flush=True)
+                content_parts.append(delta.content)
+
+            # Accumulate tool call deltas
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc_delta.id:
+                        tool_calls_acc[idx]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            tool_calls_acc[idx]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_acc[idx]["arguments"] += tc_delta.function.arguments
+
+        content = "".join(content_parts)
+
+        # ── Tool calls: execute and loop ──
+        if tool_calls_acc:
+            tc_list = [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                }
+                for tc in (tool_calls_acc[i] for i in sorted(tool_calls_acc))
+            ]
+            messages.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": tc_list,
+            })
+
+            for tc in tc_list:
+                name = tc["function"]["name"]
+                args = json.loads(tc["function"]["arguments"])
+
+                # Level 1: show tool activity
+                if name == "search_tree":
+                    print(f"  [search] \"{args.get('query', '')}\"")
+                elif name == "read_node":
+                    print(f"  [read]   {args.get('node_id', '')[:12]}...")
+                elif name == "get_outline":
+                    nid = args.get("node_id", "")
+                    print(f"  [outline] {nid[:12] + '...' if nid else '(root)'}")
+
+                result = await _execute_query_tool(name, args, tree_id, sift)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+            continue
+
+        # ── Final text response (already streamed above) ──
+        full_response = content
+        break
+    else:
+        # Exhausted max_turns — force a final answer without tools
+        messages.append({
+            "role": "user",
+            "content": "(Maximum research steps reached. Please answer now with what you have.)",
+        })
+        stream = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            stream=True,
+        )
+        parts: list[str] = []
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content
+                print(text, end="", flush=True)
+                parts.append(text)
+        full_response = "".join(parts)
+
+    dur = (time.time() - t0) * 1000
+    perf.event("query_agent", dur, turns=turn + 1, model=model)
+    print()  # Trailing newline after streamed output
+    return full_response
