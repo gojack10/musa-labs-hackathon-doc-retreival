@@ -143,10 +143,7 @@ class SiftTextClient:
         return await self._call_tool("ideation_list_trees")
 
     async def create_tree(self, name: str, scope: str) -> dict:
-        """Create a tree with the two-call confirmation dance. Returns {tree_id, root_id}."""
-        # Preview call (required by protocol)
-        await self._call_tool("ideation_create_tree", name=name, scope=scope, confirm=False)
-        # Confirm call (actually creates)
+        """Create a tree with confirm=True. Returns {tree_id, root_id}."""
         result = await self._call_tool("ideation_create_tree", name=name, scope=scope, confirm=True)
 
         # Extract tree_id from result text
