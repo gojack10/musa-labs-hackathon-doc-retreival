@@ -1,5 +1,6 @@
 """Async SiftText MCP client over StreamableHTTP."""
 
+import asyncio
 import json
 import os
 import re
@@ -43,6 +44,7 @@ class SiftTextClient:
         self._session_id: str | None = None
         self._initialized = False
         self._request_id = 0
+        self._init_lock = asyncio.Lock()
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -74,27 +76,30 @@ class SiftTextClient:
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
-        # Step 1: initialize handshake
-        init_payload = {
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "hackathon-agent", "version": "0.1.0"},
-            },
-            "id": self._next_id(),
-        }
-        await self._post(init_payload)
+        async with self._init_lock:
+            if self._initialized:
+                return
+            # Step 1: initialize handshake
+            init_payload = {
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "hackathon-agent", "version": "0.1.0"},
+                },
+                "id": self._next_id(),
+            }
+            await self._post(init_payload)
 
-        # Step 2: send initialized notification (no id, no response expected)
-        notif = {
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {},
-        }
-        await self._post(notif)
-        self._initialized = True
+            # Step 2: send initialized notification (no id, no response expected)
+            notif = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+            await self._post(notif)
+            self._initialized = True
 
     async def _call_tool(self, tool_name: str, **kwargs) -> str:
         """Call an MCP tool and return the text result."""
