@@ -12,7 +12,7 @@ client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
 
 async def complete(
-    system: str, user: str, model: str = "openai/gpt-4.1-mini"
+    system: str, user: str, model: str = "openai/gpt-5.2-chat"
 ) -> str:
     """Single-shot chat completion. Returns assistant message content."""
     resp = await client.chat.completions.create(
