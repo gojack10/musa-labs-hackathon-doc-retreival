@@ -4,18 +4,24 @@ import os
 
 from openai import AsyncOpenAI
 
-api_key = os.environ.get("OPENROUTER_API_KEY")
-if not api_key:
-    raise SystemExit("Error: Set OPENROUTER_API_KEY environment variable")
+_client: AsyncOpenAI | None = None
 
-client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+def _get_client() -> AsyncOpenAI:
+    global _client
+    if _client is None:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise SystemExit("Error: Set OPENROUTER_API_KEY environment variable")
+        _client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    return _client
 
 
 async def complete(
     system: str, user: str, model: str = "openai/gpt-5.2"
 ) -> str:
     """Single-shot chat completion. Returns assistant message content."""
-    resp = await client.chat.completions.create(
+    resp = await _get_client().chat.completions.create(
         model=model,
         messages=[
             {"role": "system", "content": system},

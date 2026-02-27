@@ -36,8 +36,8 @@ async def main():
     load_dotenv()
 
     for var in ("SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"):
-        if var not in os.environ:
-            raise SystemExit(f"Error: Set {var} environment variable")
+        if not os.environ.get(var):
+            raise SystemExit(f"Error: Set {var} in .env or environment")
 
     args = parse_args()
     sift = SiftTextClient()
