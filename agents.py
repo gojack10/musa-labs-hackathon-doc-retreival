@@ -152,9 +152,12 @@ async def linkage_agent(
     # Process in batches of 8 — collect link tasks across all batches
     batch_size = 8
     pending_links: list[dict] = []
+    total_batches = (len(nodes) + batch_size - 1) // batch_size
 
     for i in range(0, len(nodes), batch_size):
         batch = nodes[i : i + batch_size]
+        batch_num = i // batch_size + 1
+        print(f"  Batch {batch_num}/{total_batches}: analyzing {len(batch)} nodes...")
 
         batch_text = ""
         for node in batch:
@@ -171,10 +174,11 @@ async def linkage_agent(
                 model=model,
             )
         except Exception as e:
-            print(f"  Warning: linkage batch {i // batch_size + 1} failed: {e}")
+            print(f"  Batch {batch_num}/{total_batches}: failed ({e})")
             continue
 
         # Parse "SOURCE_TITLE -> TARGET_TITLE | reason" lines
+        batch_links = 0
         for line in llm_output.strip().split("\n"):
             if " -> " not in line or " | " not in line:
                 continue
@@ -192,8 +196,12 @@ async def linkage_agent(
                 "target_name": target_title,
                 "description": reason.strip(),
             })
+            batch_links += 1
+        print(f"  Batch {batch_num}/{total_batches}: found {batch_links} links")
 
     # Create all links in parallel
+    print(f"  Creating {len(pending_links)} links in parallel...")
+
     async def _create_link(link: dict) -> bool:
         async with sem:
             try:

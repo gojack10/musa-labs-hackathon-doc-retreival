@@ -12,8 +12,26 @@ from agents import triage_agent, linkage_agent, query_agent
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
+_T0 = 0.0
+
+
+def _ts() -> str:
+    """Return elapsed time as [MM:SS]."""
+    elapsed = time.time() - _T0
+    m, s = divmod(int(elapsed), 60)
+    return f"[{m:02d}:{s:02d}]"
+
+
+def _banner(stage: int, title: str):
+    """Print a stage banner with timestamp."""
+    pad = max(1, 52 - len(title))
+    print(f"\n{_ts()} {'═' * 3} Stage {stage}: {title} {'═' * pad}")
+
 
 async def main():
+    global _T0
+    _T0 = time.time()
+
     for var in ("SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"):
         if var not in os.environ:
             raise SystemExit(f"Error: Set {var} environment variable")
@@ -23,26 +41,27 @@ async def main():
 
     try:
         # Stage 0: Chunk PDF
-        t0 = time.time()
+        _banner(0, "Chunking PDF")
         chunks = chunk_pdf(args.pdf)
-        print(f"Chunked into {len(chunks)} sections ({time.time() - t0:.1f}s)")
+        level1 = [c for c in chunks if c["level"] == 1]
+        level2 = [c for c in chunks if c["level"] == 2]
+        print(f"{_ts()}   {len(chunks)} chunks extracted ({len(level1)} parents, {len(level2)} children)")
 
         # Stage 1: Create tree
-        print("Creating tree...")
+        _banner(1, "Creating Knowledge Tree")
         tree = await sift.create_tree("EU AI Act Analysis", "Parallel decomposition of EU AI Act")
         tree_id = tree["tree_id"]
         root_id = tree["root_id"]
-        print(f"Tree created: {tree_id}")
+        print(f"{_ts()}   Tree ID: {tree_id}")
 
         # Stage 2: Two-pass hierarchical creation
-        level1_chunks = [c for c in chunks if c["level"] == 1]
-        level2_chunks = [c for c in chunks if c["level"] == 2]
+        _banner(2, "Building Document Structure")
 
         # Pass 1 — structural parent nodes (no LLM, fast)
-        print(f"Creating {len(level1_chunks)} parent nodes...")
+        print(f"{_ts()}   Pass 1: Creating {len(level1)} parent nodes...")
         parent_node_ids: dict[str, str] = {}
 
-        for chunk in level1_chunks:
+        for i, chunk in enumerate(level1, 1):
             result_text = await sift.create_node(
                 name=chunk["title"],
                 scope=chunk["text"][:200] if chunk["text"] else chunk["title"],
@@ -52,55 +71,74 @@ async def main():
             match = _UUID_RE.search(result_text)
             if match:
                 parent_node_ids[chunk["title"]] = match.group(0)
-            print(f"  {chunk['title']}")
+            print(f"{_ts()}     [{i}/{len(level1)}] {chunk['title']}")
 
-        print(f"Created {len(parent_node_ids)} parent nodes")
+        print(f"{_ts()}   Pass 1 complete: {len(parent_node_ids)} parent nodes created")
 
         # Pass 2 — triage level-2 chunks under parents (parallel, with LLM)
+        print(f"\n{_ts()}   Pass 2: Triaging {len(level2)} sections with LLM (concurrency=10)...")
         sem = asyncio.Semaphore(10)
+        counter = {"done": 0}
 
         async def rate_limited_triage(chunk: dict) -> str:
             parent_id = parent_node_ids.get(chunk["parent_title"], root_id)
-            async with sem:
-                return await triage_agent(chunk, tree_id, parent_id, sift, args.model)
+            try:
+                async with sem:
+                    result = await triage_agent(chunk, tree_id, parent_id, sift, args.model)
+            except Exception:
+                counter["done"] += 1
+                print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} \u2717")
+                raise
+            counter["done"] += 1
+            print(f"{_ts()}     [{counter['done']}/{len(level2)}] {chunk['title']} \u2713")
+            return result
 
-        print(f"Triaging {len(level2_chunks)} chunks in parallel...")
-        t1 = time.time()
-        tasks = [rate_limited_triage(c) for c in level2_chunks]
+        tasks = [rate_limited_triage(c) for c in level2]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        successes = [r for r in results if not isinstance(r, Exception)]
+
         failures = [r for r in results if isinstance(r, Exception)]
-        print(f"Created {len(successes)} nodes ({time.time() - t1:.1f}s)")
+        successes = len(results) - len(failures)
+
+        print(f"{_ts()}   Pass 2 complete: {successes} nodes created", end="")
         if failures:
-            print(f"Warning: {len(failures)} chunks failed")
+            print(f" ({len(failures)} failed)")
             for f in failures[:3]:
-                print(f"  {type(f).__name__}: {f}")
+                print(f"{_ts()}     ! {type(f).__name__}: {f}")
+        else:
+            print()
 
         # Stage 3: Linkage pass
-        print("Running linkage pass...")
-        t2 = time.time()
+        _banner(3, "Cross-Reference Linkage")
         try:
             link_count = await linkage_agent(tree_id, sift, args.smart_model)
-            print(f"Added {link_count} cross-references ({time.time() - t2:.1f}s)")
+            print(f"{_ts()}   Linkage complete: {link_count} cross-references added")
         except Exception as e:
-            print(f"Warning: linkage pass failed ({type(e).__name__}: {e}), continuing without cross-references")
+            print(f"{_ts()}   ! Linkage failed ({type(e).__name__}: {e}), continuing")
+
+        # Summary
+        total = time.time() - _T0
+        m, s = divmod(int(total), 60)
+        print(f"\n{'=' * 60}")
+        print(f"  Pipeline complete in {m}m {s}s")
+        print(f"  {len(parent_node_ids)} chapters | {successes} sections | tree {tree_id[:8]}...")
+        print(f"{'=' * 60}")
 
         # Stage 4: Interactive query loop
-        total = time.time() - t0
-        print(f"\nTree ready. Total time: {total:.1f}s")
-        print("Ask questions about the EU AI Act (ctrl+c to exit):\n")
+        _banner(4, "Interactive Query")
+        print(f"{_ts()}   Ask questions about the EU AI Act (ctrl+c to exit)\n")
         try:
             while True:
                 q = await asyncio.to_thread(input, "> ")
                 if not q.strip():
                     continue
+                print(f"{_ts()}   Searching tree...")
                 try:
                     answer = await query_agent(q, tree_id, sift, args.smart_model)
                     print(f"\n{answer}\n")
                 except Exception as e:
-                    print(f"\nError answering query ({type(e).__name__}: {e}). Try again.\n")
+                    print(f"\n{_ts()}   ! Error: {type(e).__name__}: {e}. Try again.\n")
         except (KeyboardInterrupt, EOFError):
-            print("\nDone.")
+            print("\n\nDone.")
 
     finally:
         await sift.close()
