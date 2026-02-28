@@ -1,35 +1,22 @@
-"""Orchestrator: chunk markdown -> create tree -> parallel triage -> linkage -> query loop."""
+"""CLI dispatcher: routes to markdown or code document pipeline."""
 
 import asyncio
 import argparse
 import os
-import re
 import time
 
 from dotenv import load_dotenv
 
-from chunk import chunk_markdown
-from perf import perf
-from sifttext import SiftTextClient
-from rich.console import Console
-from agents import triage_agent, linkage_agent, query_agent
-
-_console = Console()
-
-_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+from lib.config import console
+from lib.perf import perf
+from lib.sifttext import SiftTextClient
+from agents.tree_query_agent.agent import query_agent
 
 
 def _ts() -> str:
-    """Return elapsed time as [MM:SS]."""
     elapsed = time.time() - perf._t0
     m, s = divmod(int(elapsed), 60)
     return f"[{m:02d}:{s:02d}]"
-
-
-def _banner(stage: int, title: str):
-    """Print a stage banner with timestamp."""
-    pad = max(1, 52 - len(title))
-    print(f"\n{_ts()} {'═' * 3} Stage {stage}: {title} {'═' * pad}")
 
 
 async def main():
@@ -45,130 +32,36 @@ async def main():
 
     try:
         if args.query_only:
-            # Skip pipeline, jump straight to query loop
             tree_id = args.query_only
         else:
-            # Stage 0: Chunk markdown
-            _banner(0, "Chunking Markdown")
-            perf.stage("0_chunking")
-            chunks = chunk_markdown(args.input)
-            level1 = [c for c in chunks if c["level"] == 1]
-            level2_plus = [c for c in chunks if c["level"] >= 2]
-            print(f"{_ts()}   {len(chunks)} chunks extracted ({len(level1)} parents, {len(level2_plus)} children)")
-
-            # Stage 1: Create tree
-            _banner(1, "Creating Knowledge Tree")
-            perf.stage("1_tree_creation")
-            tree = await sift.create_tree("EU AI Act Analysis", "Parallel decomposition of EU AI Act")
-            tree_id = tree["tree_id"]
-            root_id = tree["root_id"]
-            print(f"{_ts()}   Tree ID: {tree_id}")
-
-            # Stage 2: Two-pass hierarchical creation
-            _banner(2, "Building Document Structure")
-
-            # Pass 1 — structural parent nodes (parallel, no LLM)
-            perf.stage("2a_parent_nodes")
-            print(f"{_ts()}   Pass 1: Creating {len(level1)} parent nodes (parallel)...")
-            parent_node_ids: dict[str, str] = {}
-            p1_sem = asyncio.Semaphore(10)
-
-            async def _create_parent(i: int, chunk: dict) -> tuple[str, str | None]:
-                async with p1_sem:
-                    result_text = await sift.create_node(
-                        name=chunk["title"],
-                        scope=chunk["text"][:200] if chunk["text"] else chunk["title"],
-                        parent_id=root_id,
-                        tree_id=tree_id,
-                        pipeline_mode=True,
-                    )
-                match = _UUID_RE.search(result_text)
-                nid = match.group(0) if match else None
-                print(f"{_ts()}     [{i}/{len(level1)}] {chunk['title']}")
-                return chunk["title"], nid
-
-            p1_results = await asyncio.gather(
-                *[_create_parent(i, c) for i, c in enumerate(level1, 1)],
-                return_exceptions=True,
-            )
-            for r in p1_results:
-                if isinstance(r, tuple):
-                    title, nid = r
-                    if nid:
-                        parent_node_ids[title] = nid
-
-            print(f"{_ts()}   Pass 1 complete: {len(parent_node_ids)} parent nodes created")
-
-            # Pass 2 — triage level-2 chunks under parents (parallel, with LLM)
-            perf.stage("2b_triage")
-            print(f"\n{_ts()}   Pass 2: Triaging {len(level2_plus)} sections with LLM (concurrency=10)...")
-            sem = asyncio.Semaphore(10)
-            counter = {"done": 0}
-
-            async def rate_limited_triage(chunk: dict) -> str:
-                parent_id = parent_node_ids.get(chunk["parent_title"], root_id)
-                try:
-                    async with sem:
-                        result = await triage_agent(chunk, tree_id, parent_id, sift, args.model, pipeline_mode=True)
-                except Exception:
-                    counter["done"] += 1
-                    print(f"{_ts()}     [{counter['done']}/{len(level2_plus)}] {chunk['title']} ✗")
-                    raise
-                counter["done"] += 1
-                print(f"{_ts()}     [{counter['done']}/{len(level2_plus)}] {chunk['title']} ✓")
-                return result
-
-            tasks = [rate_limited_triage(c) for c in level2_plus]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            failures = [r for r in results if isinstance(r, Exception)]
-            successes = len(results) - len(failures)
-
-            print(f"{_ts()}   Pass 2 complete: {successes} nodes created", end="")
-            if failures:
-                print(f" ({len(failures)} failed)")
-                for f in failures[:3]:
-                    print(f"{_ts()}     ! {type(f).__name__}: {f}")
+            if args.mode == "markdown":
+                from agents.markdown_agent.pipeline import run
+            elif args.mode == "code":
+                from agents.code_document_agent.pipeline import run
             else:
-                print()
+                raise SystemExit(f"Unknown mode: {args.mode}")
 
-            # Stage 3: Linkage pass
-            _banner(3, "Cross-Reference Linkage")
-            perf.stage("3_linkage")
-            try:
-                link_count = await linkage_agent(tree_id, sift, args.smart_model, pipeline_mode=True)
-                print(f"{_ts()}   Linkage complete: {link_count} cross-references added")
-            except Exception as e:
-                print(f"{_ts()}   ! Linkage failed ({type(e).__name__}: {e}), continuing")
+            tree_id = await run(args.input, sift, args.model, args.smart_model)
 
-            # Finish profiling and print summary
-            perf.finish()
-            perf.summary()
-            log_path = perf.save()
-
-            # Summary
-            total = time.time() - perf._t0
-            m, s = divmod(int(total), 60)
-            print(f"\n{'=' * 60}")
-            print(f"  Pipeline complete in {m}m {s}s")
-            print(f"  {len(parent_node_ids)} chapters | {successes} sections | tree {tree_id[:8]}...")
-            print(f"  Perf log: {log_path}")
-            print(f"{'=' * 60}")
-
-        # Interactive query loop (runs for both pipeline and query-only modes)
-        _banner(4, "Interactive Query")
+        # Interactive query loop
+        pad = max(1, 52 - len("Interactive Query"))
+        print(f"\n{_ts()} {'═' * 3} Stage 4: Interactive Query {'═' * pad}")
         print(f"{_ts()}   Tree: {tree_id}")
-        print(f"{_ts()}   Ask questions about the EU AI Act (ctrl+c to exit)\n")
+        print(f"{_ts()}   Ask questions (ctrl+c to exit)\n")
         history: list[dict] | None = None
+        prompt_name = "tree_query"
         try:
             while True:
-                _console.print("> ", style="green", end="")
+                console.print("> ", style="green", end="")
                 q = await asyncio.to_thread(input)
                 if not q.strip():
                     continue
                 print()
                 try:
-                    _, history = await query_agent(q, tree_id, sift, args.smart_model, history=history)
+                    _, history = await query_agent(
+                        q, tree_id, sift, args.smart_model,
+                        history=history, prompt_name=prompt_name,
+                    )
                     print()
                 except Exception as e:
                     print(f"\n{_ts()}   ! Error: {type(e).__name__}: {e}. Try again.\n")
@@ -180,8 +73,10 @@ async def main():
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Enterprise Doc Agent")
-    p.add_argument("--input", default="eu_ai_act.md", help="Path to markdown file")
+    p = argparse.ArgumentParser(description="Document Analysis Pipeline")
+    p.add_argument("--mode", choices=["markdown", "code"], default="markdown",
+                   help="Pipeline mode (default: markdown)")
+    p.add_argument("--input", default="eu_ai_act.md", help="Path to input file or directory")
     p.add_argument("--model", default="gpt-5.2-chat-main", help="Triage model (Azure deployment name)")
     p.add_argument("--smart-model", default="gpt-5.2-chat-main", help="Linkage/query model (Azure deployment name)")
     p.add_argument("--query-only", metavar="TREE_ID",

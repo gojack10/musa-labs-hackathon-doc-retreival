@@ -5,7 +5,7 @@ import time
 
 from openai import AsyncAzureOpenAI
 
-from perf import perf
+from lib.perf import perf
 
 AZURE_ENDPOINT = "https://odlu-mm5f7ry7-eastus2.cognitiveservices.azure.com/"
 AZURE_API_VERSION = "2024-12-01-preview"

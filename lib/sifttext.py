@@ -3,18 +3,16 @@
 import asyncio
 import json
 import os
-import re
 import time
 
 import httpx
 
-from perf import perf
+from lib.perf import perf
+from lib.config import UUID_RE
 
 ENDPOINT = "https://app.sifttext.com/mcp"
 PROTOCOL_VERSION = "2025-03-26"
 PROPAGATION = "no_propagation: automated document decomposition"
-
-_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def _parse_sse(text: str) -> dict:
@@ -147,14 +145,14 @@ class SiftTextClient:
         result = await self._call_tool("ideation_create_tree", name=name, scope=scope, confirm=True)
 
         # Extract tree_id from result text
-        tree_match = _UUID_RE.search(result)
+        tree_match = UUID_RE.search(result)
         if not tree_match:
             raise RuntimeError(f"Could not parse tree_id from create_tree response: {result}")
         tree_id = tree_match.group(0)
 
         # Get root_id from outline
         outline = await self.get_outline(tree_id, max_depth=1)
-        root_match = _UUID_RE.search(outline)
+        root_match = UUID_RE.search(outline)
         if not root_match:
             raise RuntimeError(f"Could not parse root_id from outline: {outline}")
         root_id = root_match.group(0)
