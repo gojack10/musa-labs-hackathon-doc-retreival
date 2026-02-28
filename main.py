@@ -49,7 +49,7 @@ async def main():
         print(f"{_ts()}   Tree: {tree_id}")
         print(f"{_ts()}   Ask questions (ctrl+c to exit)\n")
         history: list[dict] | None = None
-        prompt_name = "tree_query"
+        prompt_name = "code_query" if args.mode == "code" else "tree_query"
         try:
             while True:
                 console.print("> ", style="green", end="")
