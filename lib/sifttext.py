@@ -235,5 +235,25 @@ class SiftTextClient:
             kwargs["pipeline_mode"] = True
         return await self._call_tool("ideation_crystallize_append", **kwargs)
 
+    async def set_vitals(
+        self,
+        node_id: str,
+        micro_summary: str | None = None,
+        warnings: str | None = None,
+        propagation_check: str = PROPAGATION,
+        pipeline_mode: bool = False,
+    ) -> str:
+        kwargs: dict = {
+            "node_id": node_id,
+            "propagation_check": propagation_check,
+        }
+        if micro_summary is not None:
+            kwargs["micro_summary"] = micro_summary
+        if warnings is not None:
+            kwargs["warnings"] = warnings
+        if pipeline_mode:
+            kwargs["pipeline_mode"] = True
+        return await self._call_tool("ideation_set_vitals", **kwargs)
+
     async def close(self) -> None:
         await self._http.aclose()
