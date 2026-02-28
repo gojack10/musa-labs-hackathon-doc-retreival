@@ -234,8 +234,6 @@ async def query_agent(
 
         return "".join(content_parts), tc_list, reasoning_details_raw, usage
 
-    total_usage = {"input": 0, "output": 0}
-
     for turn in range(max_turns):
         stream = await client.chat.completions.create(
             model=model,
@@ -248,8 +246,6 @@ async def query_agent(
 
         state: dict = {}
         content, tc_list, reasoning_details_raw, usage = await _collect_stream(stream, state)
-        total_usage["input"] += usage.get("input", 0)
-        total_usage["output"] += usage.get("output", 0)
 
         # ── Tool calls: execute and loop ──
         if tc_list:
@@ -371,8 +367,6 @@ async def query_agent(
         )
         state = {}
         content, _, _, usage = await _collect_stream(stream, state)
-        total_usage["input"] += usage.get("input", 0)
-        total_usage["output"] += usage.get("output", 0)
         full_response = content
         if full_response.strip():
             messages.append({"role": "assistant", "content": full_response})
@@ -386,13 +380,6 @@ async def query_agent(
             cname = node_names.get(cid, cid[:12] + "…")
             names.append(cname)
         console.print("  " + "  ·  ".join(f"[italic blue]{n}[/]" for n in names))
-
-    # ── Token usage ──
-    if total_usage["input"] or total_usage["output"]:
-        console.print(
-            f"  tokens: {total_usage['input']:,} in · {total_usage['output']:,} out",
-            style="dim",
-        )
 
     dur = (time.time() - t0) * 1000
     perf.event("query_agent", dur, turns=turn + 1, model=model)
