@@ -1,9 +1,9 @@
-"""Azure OpenAI LLM client — with perf instrumentation."""
+"""LLM clients — Azure OpenAI + OpenRouter, with perf instrumentation."""
 
 import os
 import time
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from lib.perf import perf
 
@@ -11,7 +11,11 @@ AZURE_ENDPOINT = "https://odlu-mm5f7ry7-eastus2.cognitiveservices.azure.com/"
 AZURE_API_VERSION = "2024-12-01-preview"
 DEFAULT_DEPLOYMENT = "gpt-5.2-chat-main"
 
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DEFAULT_MODEL = "anthropic/claude-sonnet-4.6"
+
 _client: AsyncAzureOpenAI | None = None
+_openrouter_client: AsyncOpenAI | None = None
 
 
 def _get_client() -> AsyncAzureOpenAI:
@@ -29,8 +33,22 @@ def _get_client() -> AsyncAzureOpenAI:
 
 
 def get_client() -> AsyncAzureOpenAI:
-    """Get or create the shared AsyncOpenAI client."""
+    """Get or create the shared Azure OpenAI client."""
     return _get_client()
+
+
+def get_openrouter_client() -> AsyncOpenAI:
+    """Get or create the shared OpenRouter client."""
+    global _openrouter_client
+    if _openrouter_client is None:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise SystemExit("Error: Set OPENROUTER_API_KEY environment variable")
+        _openrouter_client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=OPENROUTER_BASE_URL,
+        )
+    return _openrouter_client
 
 
 async def complete(

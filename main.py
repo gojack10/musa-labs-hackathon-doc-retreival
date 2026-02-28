@@ -23,11 +23,15 @@ async def main():
     perf.start()
     load_dotenv()
 
-    for var in ("SIFTTEXT_API_KEY", "AZURE_OPENAI_KEY"):
+    args = parse_args()
+
+    required = ["SIFTTEXT_API_KEY", "OPENROUTER_API_KEY"]
+    if not args.query_only:
+        required.append("AZURE_OPENAI_KEY")  # pipeline agents use Azure
+    for var in required:
         if not os.environ.get(var):
             raise SystemExit(f"Error: Set {var} in .env or environment")
 
-    args = parse_args()
     sift = SiftTextClient()
 
     try:
@@ -59,8 +63,9 @@ async def main():
                 print()
                 try:
                     _, history = await query_agent(
-                        q, tree_id, sift, args.smart_model,
+                        q, tree_id, sift, args.query_model,
                         history=history, prompt_name=prompt_name,
+                        debug=args.debug,
                     )
                     print()
                 except Exception as e:
@@ -78,9 +83,13 @@ def parse_args():
                    help="Pipeline mode (default: markdown)")
     p.add_argument("--input", default="eu_ai_act.md", help="Path to input file or directory")
     p.add_argument("--model", default="gpt-5.2-chat-main", help="Triage model (Azure deployment name)")
-    p.add_argument("--smart-model", default="gpt-5.2-chat-main", help="Linkage/query model (Azure deployment name)")
+    p.add_argument("--smart-model", default="gpt-5.2-chat-main", help="Pipeline linkage model (Azure deployment name)")
+    p.add_argument("--query-model", default="anthropic/claude-sonnet-4.6",
+                   help="Query agent model (OpenRouter model ID)")
     p.add_argument("--query-only", metavar="TREE_ID",
                    help="Skip pipeline, jump straight to query loop on an existing tree")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable debug logging for link traversal and tool internals")
     return p.parse_args()
 
 
