@@ -265,15 +265,7 @@ async def query_agent(
             for tc in tc_list:
                 fname = tc["function"]["name"]
                 raw_args = tc["function"]["arguments"]
-                if not raw_args or not raw_args.strip():
-                    console.print(f"  \\[{fname}] skipped — empty arguments from model", style="dim red")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": "Error: empty arguments. Please retry with valid arguments.",
-                    })
-                    continue
-                args = json.loads(raw_args)
+                args = json.loads(raw_args) if raw_args and raw_args.strip() else {}
                 result = await _execute_query_tool(fname, args, tree_id, sift)
 
                 # Extract node names from results into cache
