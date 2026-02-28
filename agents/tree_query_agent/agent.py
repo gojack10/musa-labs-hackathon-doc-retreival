@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 import time
 
@@ -9,9 +10,11 @@ from rich.live import Live
 from rich.markdown import Markdown
 
 from lib.config import UUID_RE, console, load_prompt
-from lib.llm import get_client
+from lib.llm import get_openrouter_client, OPENROUTER_DEFAULT_MODEL
 from lib.perf import perf
 from lib.sifttext import SiftTextClient
+
+_dbg = logging.getLogger("query_agent.debug")
 
 QUERY_TOOLS = [
     {
@@ -86,10 +89,11 @@ async def query_agent(
     question: str,
     tree_id: str,
     sift: SiftTextClient,
-    model: str = "gpt-5.2-chat-main",
+    model: str = OPENROUTER_DEFAULT_MODEL,
     max_turns: int = 10,
     history: list[dict] | None = None,
     prompt_name: str = "tree_query",
+    debug: bool = False,
 ) -> tuple[str, list[dict]]:
     """Agentic query with read-only tree tools and streaming output.
 
@@ -97,7 +101,14 @@ async def query_agent(
     Level 2 streaming: final answer tokens streamed to stdout.
     Returns (response_text, conversation_history) for multi-turn context.
     """
-    client = get_client()
+    if debug and not _dbg.handlers:
+        _fh = logging.FileHandler("/tmp/query_agent_debug.log", mode="a")
+        _fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+        _dbg.addHandler(_fh)
+        _dbg.setLevel(logging.DEBUG)
+        _dbg.debug("=== new query: %s ===", question)
+
+    client = get_openrouter_client()
     if history is not None:
         messages = history + [{"role": "user", "content": question}]
     else:
@@ -116,7 +127,12 @@ async def query_agent(
     linked_ids: set[str] = set()      # IDs seen in <links> sections
     cited_ids: list[str] = []         # read_node targets, in order
 
-    reasoning_kwargs = {}  # Azure OpenAI — no extra_body reasoning
+    reasoning_kwargs = {
+        "extra_body": {
+            "reasoning": {"type": "enabled", "budget_tokens": 10000},
+            "include_reasoning": True,
+        },
+    }
 
     def _stream_reasoning(rd, state: dict) -> list[dict]:
         """Print reasoning tokens dimmed; return raw details for context preservation."""
@@ -248,7 +264,16 @@ async def query_agent(
 
             for tc in tc_list:
                 fname = tc["function"]["name"]
-                args = json.loads(tc["function"]["arguments"])
+                raw_args = tc["function"]["arguments"]
+                if not raw_args or not raw_args.strip():
+                    console.print(f"  \\[{fname}] skipped — empty arguments from model", style="dim red")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": "Error: empty arguments. Please retry with valid arguments.",
+                    })
+                    continue
+                args = json.loads(raw_args)
                 result = await _execute_query_tool(fname, args, tree_id, sift)
 
                 # Extract node names from results into cache
@@ -268,11 +293,34 @@ async def query_agent(
                             node_names[nid] = nname
                 if fname == "read_node":
                     # Collect linked IDs for link-traversal detection
-                    for lid in UUID_RE.findall(
-                        re.search(r"<links>(.*?)</links>", result, re.DOTALL).group(1)
-                        if re.search(r"<links>(.*?)</links>", result, re.DOTALL) else ""
-                    ):
-                        linked_ids.add(lid)
+                    # SiftText uses multiple tags for links: <links>, <linked_nodes>,
+                    # <see_also>, <backlinks>. Scan all of them.
+                    found_lids: list[str] = []
+                    matched_tags: list[str] = []
+                    for link_tag in ("links", "linked_nodes", "see_also", "backlinks"):
+                        tag_match = re.search(rf"<{link_tag}>(.*?)</{link_tag}>", result, re.DOTALL)
+                        if tag_match:
+                            matched_tags.append(link_tag)
+                            for lid in UUID_RE.findall(tag_match.group(1)):
+                                if lid != args.get("node_id", ""):  # exclude self-references
+                                    found_lids.append(lid)
+                                    linked_ids.add(lid)
+                    # Also grab inline [[Name|uuid]] links from crystallization/scope
+                    for lid in re.findall(r'\[\[[^\]]*\|([0-9a-f-]{36})', result):
+                        if lid != args.get("node_id", "") and lid not in linked_ids:
+                            found_lids.append(lid)
+                            linked_ids.add(lid)
+                    if debug:
+                        if found_lids:
+                            _dbg.debug("read %s: link sources: %s → %d UUIDs",
+                                       args.get("node_id", "")[:8], ', '.join(matched_tags) or 'inline only', len(found_lids))
+                            for lid in found_lids[:5]:
+                                lname = node_names.get(lid, "?")
+                                _dbg.debug("  %s… (%s)", lid[:8], lname)
+                            if len(found_lids) > 5:
+                                _dbg.debug("  …and %d more", len(found_lids) - 5)
+                        else:
+                            _dbg.debug("read %s: no links found", args.get("node_id", "")[:8])
 
                 # Tool activity display (after execution so we have names)
                 if fname == "search_tree":
@@ -284,6 +332,10 @@ async def query_agent(
                     via = ""
                     if nid in linked_ids:
                         via = " → via link"
+                        if debug:
+                            _dbg.debug("MATCH: %s… was in linked_ids", nid[:8])
+                    elif debug and linked_ids:
+                        _dbg.debug("%s… NOT in linked_ids (%d tracked)", nid[:8], len(linked_ids))
                     console.print(f"  \\[read] {label}", style="dim", end="", highlight=False)
                     if via:
                         console.print(via, style="blue", end="", highlight=False)
