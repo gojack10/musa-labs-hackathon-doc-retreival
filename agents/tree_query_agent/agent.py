@@ -182,7 +182,7 @@ async def query_agent(
                     _end_reasoning(state)
                     content_parts.append(delta.content)
                     if live is None:
-                        live = Live(Markdown("".join(content_parts)), console=console, refresh_per_second=8)
+                        live = Live(Markdown("".join(content_parts)), console=console, refresh_per_second=8, vertical_overflow="visible")
                         live.start()
                     else:
                         live.update(Markdown("".join(content_parts)))
